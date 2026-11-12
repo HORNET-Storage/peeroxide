@@ -17,6 +17,10 @@ name: Binary Release
 # assets on its own schedule and opens same-repo bump PRs. This workflow
 # does not touch the tap; it only publishes assets here.
 #
+# Run by hand with a ref that is not a release tag, such as `main`, it
+# builds every platform and publishes nothing. That is how the builds are
+# tried before a release.
+#
 # Authentication: default GITHUB_TOKEN only. No PATs.
 
 on:
@@ -26,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build and publish (e.g. peeroxide-cli-v0.2.0)'
+        description: 'Tag to build and publish (e.g. peeroxide-cli-v0.2.0). Any other ref, such as main, is built and not published.'
         required: true
         type: string
 
@@ -232,6 +236,9 @@ jobs:
   publish:
     name: Attach to Release
     needs: [macos, linux]
+    # Only a release tag has a Release to attach to. For any other ref the
+    # platforms above are built, and nothing is published.
+    if: ${{ startsWith(inputs.tag || github.ref_name, 'peeroxide-cli-v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
