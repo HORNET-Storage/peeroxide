@@ -9,8 +9,19 @@ on:
 
 jobs:
   test:
-    name: Test workspace
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # The transport has code of its own for each system, so the workspace is
+      # tested on macOS as well. What fails on one system says nothing of the
+      # other, so each runs to its end.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Test workspace
+            os: ubuntu-latest
+          - name: Test workspace (macOS)
+            os: macos-15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -25,8 +36,17 @@ jobs:
       - run: cargo test --workspace
 
   clippy:
-    name: Clippy workspace
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Code that is compiled for one system only is linted on that system only.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Clippy workspace
+            os: ubuntu-latest
+          - name: Clippy workspace (macOS)
+            os: macos-15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
