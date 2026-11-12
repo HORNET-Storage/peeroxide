@@ -128,7 +128,7 @@ UDX uses BBR (Bottleneck Bandwidth and RTT) congestion control.
 ### State Machine
 
 ```
-STARTUP --[bw plateau 3 rounds]--> DRAIN --[inflight <= BDP]--> PROBE_BW
+STARTUP --[path counts as full]--> DRAIN --[inflight <= BDP]--> PROBE_BW
                                                                     |
                                                      every 10s ----+
                                                                     v
@@ -141,7 +141,7 @@ STARTUP --[bw plateau 3 rounds]--> DRAIN --[inflight <= BDP]--> PROBE_BW
 
 | State | Pacing Gain | cwnd Gain | Exit Condition |
 |-------|-------------|-----------|----------------|
-| STARTUP | 2.885 (2/ln2) | 2.885 | BW hasn't grown 25% for 3 rounds |
+| STARTUP | 2.885 (2/ln2) | 2.885 | BW hasn't grown 25% for 3 rounds, or a round shows a queue and loss |
 | DRAIN | 0.347 (1/2.885) | 2.885 | Inflight <= BDP |
 | PROBE_BW | cycles [1.25, 0.75, 1.0x6] | 2.0 | Cycles each RTT; PROBE_RTT every 10s |
 | PROBE_RTT | 1.0 | -- (cwnd=4 pkts) | After 200ms + 1 RTT with inflight <= 4 |
@@ -150,7 +150,34 @@ The window is `cwnd gain * BDP`, where the BDP is the bandwidth estimate times
 the lowest round-trip time of the last ten seconds, counted as at least one
 millisecond. Once the path's bandwidth is known, the window also grows by how
 far acknowledgements have been seen to run ahead of that estimate, up to what
-the bandwidth delivers in 100 ms.
+the bandwidth delivers in 100 ms. Only packets that were delivered in time
+count as running ahead: see Rate Sampling and Pacing.
+
+Startup takes the path for full in one of two ways. The first is C libudx's:
+the bandwidth estimate has gone three round trips without growing by a
+quarter. The second is not in C libudx: a round trip has shown both a queue
+at the bottleneck and loss.
+
+- A queue: the lowest round-trip time of that round trip is above the
+  path's lowest by an eighth of it, and by no less than 4 ms and no more
+  than 16. This is how HyStart++ reads a queue (RFC 9406).
+- Loss: in loss recovery, more than 2% of what was in flight was lost, with
+  at least eight acknowledgements revealing loss. This is how BBRv2 reads
+  loss in Startup.
+
+Startup keeps up to 2.89 times what the path holds in flight, so a path
+that queues less than the rest drops it, and the first rule takes at least
+three more round trips to notice, during which the queue goes on
+overflowing. The second rule takes one.
+
+BBRv2 ends Startup on the loss alone. Loss at random above 2% then ends it
+long before the path is full, and BBR finds the rest of the bandwidth a
+quarter at a time: through a path with a round trip of 100 ms that lost 5%
+of its packets, a transfer between two ends of this crate was 29% slower
+for it. Loss at random builds no queue, and a queue that lasts a round trip
+says that the bottleneck was busy throughout, so the estimate holds what
+the path carries. The round trips of the second rule are counted apart from
+BBR's own, which start afresh whenever recovery begins.
 
 ### Loss Recovery (CA states)
 
@@ -235,19 +262,24 @@ raises the MTU to its size, and the next size is tried. A probe that is lost
 goes out again without its padding, and after MTU_MAX_PROBES lost probes the
 search ends.
 
-The search needs a packet that is too large to be dropped, not split. A
-socket's packets are therefore marked "don't fragment" when it is bound, as C
-libudx marks them: `IP_MTU_DISCOVER` is set to `IP_PMTUDISC_PROBE` on Linux,
-Android and Windows, and `IP_DONTFRAG` on Apple's systems and FreeBSD. Without
-the mark every probe arrives, in fragments, the search ends at MTU_MAX
-whatever the path, and every full packet after it travels as two. The mark
-covers all of the socket's packets, datagrams sent with `UdxSocket::send_to`
-included.
+The search needs a packet that is too large to be dropped, not split. On
+Linux a socket's packets are therefore marked "don't fragment" when it is
+bound, as C libudx marks them: `IP_MTU_DISCOVER` is set to
+`IP_PMTUDISC_PROBE`, and `IPV6_MTU_DISCOVER` to `IPV6_PMTUDISC_PROBE`. The
+mark covers all of the socket's packets, datagrams sent with
+`UdxSocket::send_to` included. On connecting, a stream there also asks the
+system for the MTU of the link its remote is reached over, and searches no
+further than that: a larger packet would not leave the machine. If that MTU
+is MTU_BASE or less, there is no search.
 
-On connecting, a stream asks the system for the MTU of the link its remote is
-reached over, where the system tells it (Linux, Android and Windows), and
-searches no further than that: a larger packet would not leave the machine.
-If that MTU is MTU_BASE or less, there is no search.
+C libudx marks the packets on every system, and asks for the link's MTU on
+Linux and Windows. This crate contains no `unsafe` code, and only for Linux
+is there a safe call for either, in rustix: neither the standard library,
+tokio nor socket2 has one for any system. On the other systems a probe that
+is too large for the path therefore still arrives, in fragments, and the
+search ends at MTU_MAX whatever the path. A full packet is then an IP packet
+of 1500 bytes: whole on a path that carries 1500, and in two fragments on a
+narrower one.
 
 Packets are cut when they are sent, so a larger MTU applies from the next
 packet on, to what was written before it was found too. The congestion window
@@ -278,6 +310,25 @@ The intervals of a rate sample are measured in microseconds, where C libudx
 measures them in whole milliseconds. Between two programs on one machine or
 one network a round trip takes a fraction of a millisecond, and a sample
 there, in whole milliseconds, is either unusable or several times too low.
+
+A rate sample counts the packets that were delivered in its interval, as far
+as their acknowledgement can tell, where C libudx counts every packet the
+acknowledgement names. An acknowledgement names a limited number of ranges,
+the lowest ones (see SACK Format). After a burst of losses the remote
+therefore reports, as the gaps below them close, hundreds of packets at once
+that had arrived many round trips before. Counted as deliveries of that
+moment, such reports were seen to put the bandwidth estimate at two and a
+half times what the path carried, and the estimate holds for ten round
+trips, in which the stream overfills the queue again. So:
+
+- A packet that was sent before one that an earlier acknowledgement had
+  already acknowledged was reported late. It counts as delivered, for the
+  window and for the round trips, and is left out of rate samples and of the
+  count of acknowledgements that run ahead of the estimate
+- The packets of one acknowledgement do not make each other late
+- An acknowledgement that comes sooner after a packet was sent again than
+  the lowest round-trip time answers the earlier sending. The packet is
+  placed by when it was first sent, and no sample starts from it
 
 ## Relay (Packet Forwarding)
 
@@ -319,15 +370,15 @@ C reference:
   returns once everything has arrived
 - An acknowledgement lists the gaps nearest the cumulative ACK, up to 144
   ranges here and 51 in C libudx. When a burst of loss leaves more gaps than
-  that, the sender learns late of what arrived beyond them. It may send
-  again what had arrived, and it counts those deliveries in a later interval,
-  which overstates its bandwidth estimate for some round trips. C libudx
-  behaves the same way
-- On leaving loss recovery in Startup the congestion window is 65,535
-  packets until the next loss, so only the pacer holds the stream back for
-  that while, and the end of Startup overflows a shallow queue. C libudx
-  does the same. Capping the window there, or saving and restoring it as
-  Linux's BBR does, was measured and made transfers no faster
+  that, the sender learns late of what arrived beyond them, and may send
+  again what had arrived. It leaves those late reports out of its rate
+  samples (see Rate Sampling and Pacing). C libudx counts them, which
+  overstates its bandwidth estimate for some round trips
+- A loss recovery in Startup that does not end Startup leaves the
+  congestion window at 65,535 packets until the next loss, so only the
+  pacer holds the stream back for that while. C libudx does the same.
+  Capping the window there, or saving and restoring it as Linux's BBR does,
+  was measured and made transfers no faster
 - The retransmission timeout is never under a second, as in C libudx. A
   flight whose last packets were all lost during recovery is repaired only
   when it fires, since no tail loss probe is armed then
@@ -335,6 +386,10 @@ C reference:
   of zero would hold a sender here until that remote's next packet. C
   libudx probes. No remote was seen to advertise one: `udx-native` took
   31.5 MB with nothing reading it
+- A socket's packets are marked "don't fragment" on Linux only, for want of
+  a safe call on the other systems (see MTU Path Discovery). There a stream
+  on a path that carries less than 1500 bytes settles on 1500, and its full
+  packets travel as two fragments each. C libudx marks them on every system
 - `UdxError::Uv(i32)` exists for API compatibility but is never emitted
   by the native backend (only `Io` and `StreamClosed` are used)
 

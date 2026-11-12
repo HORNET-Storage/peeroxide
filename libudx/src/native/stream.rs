@@ -167,6 +167,8 @@ struct SentPacket {
     packet: Arc<[u8]>,
     /// When this packet was last sent.
     time_sent: Instant,
+    /// When this packet was first sent.
+    first_sent: Instant,
     /// How many times this packet has been sent.
     transmits: u32,
     /// How many times the retransmission timer has fired for this packet.
@@ -905,6 +907,7 @@ impl StreamInner {
         // Taken before loss detection runs below, as in C. The losses this
         // acknowledgement reveals are therefore not in the rate sample, there
         // or here, and congestion control does not shrink the window by them.
+        // It is told of them apart, to see when Startup has filled the path.
         let lost = self.congestion.lost.wrapping_sub(lost_before);
 
         // RFC 8985, 7.2
@@ -930,6 +933,7 @@ impl StreamInner {
             let summary = AckSummary {
                 delivered,
                 lost,
+                newly_lost: self.congestion.lost.wrapping_sub(lost_before),
                 inflight: self.inflight(),
                 srtt_ms: self.srtt,
                 rtt_min_ms: self.rtt_min.get(),
@@ -962,16 +966,22 @@ impl StreamInner {
         }
 
         let retransmitted = pkt.transmits > 1;
+        let rtt = now.saturating_duration_since(pkt.time_sent);
+        let rtt_ms = self.clamp_rtt(rtt.as_millis() as u64);
+        // An acknowledgement that comes sooner after a packet was last sent
+        // than a round trip takes answers an earlier sending of it.
+        let answers_earlier = retransmitted && rtt_ms < self.rtt_min.get();
+
         let delivered = DeliveredPacket {
             seq,
             time_sent: self.micros(pkt.time_sent),
+            first_sent: self.micros(pkt.first_sent),
             retransmitted,
+            answers_earlier,
             info: pkt.rate_info,
         };
         self.congestion.on_packet_delivered(rs, &delivered);
 
-        let rtt = now.saturating_duration_since(pkt.time_sent);
-        let rtt_ms = self.clamp_rtt(rtt.as_millis() as u64);
         let next = seq.wrapping_add(1);
 
         // An acknowledgement of a packet sent more than once does not say
@@ -986,7 +996,7 @@ impl StreamInner {
         // RFC 8985, 6.2 step 2: remember the most recently sent packet that
         // has been delivered. A retransmitted one counts when the time since
         // it was last sent is a possible round trip.
-        if !retransmitted || rtt_ms >= self.rtt_min.get() {
+        if !answers_earlier {
             self.rack_rtt = rtt;
             rs.rtt_ms = Some(rtt_ms);
 
@@ -1549,6 +1559,7 @@ impl StreamInner {
             self.outgoing.insert(seq, SentPacket {
                 packet: Arc::clone(&packet),
                 time_sent: now,
+                first_sent: now,
                 transmits: 1,
                 rto_timeouts: 0,
                 is_mtu_probe,
@@ -1753,12 +1764,13 @@ impl UdxStream {
     ) -> Result<()> {
         let udp = socket.udp_arc()?;
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let link_mtu = super::pmtu::link_mtu(remote_addr);
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.remote_id = remote_id;
             inner.set_remote_addr(remote_addr);
-            inner.limit_mtu_to_link(super::sockopt::link_mtu(remote_addr));
+            inner.limit_mtu_to_link(link_mtu);
             inner.udp = Some(udp);
             inner.connected = true;
             inner.notify_tx = Some(notify_tx);
@@ -2030,6 +2042,11 @@ pub(crate) struct TakenIn {
     /// The task that took the packet in sends it ([`send_ack`]). One that
     /// the stream owed already is on its way from whoever was told so.
     pub(crate) ack_owed: bool,
+    /// Whether the acknowledgement is not to be kept waiting for more
+    /// packets: this one left a gap in what has arrived, or is one the
+    /// stream had already, or ends the stream. The remote is waiting to hear
+    /// of each.
+    pub(crate) ack_now: bool,
     /// What the stream's own task still has to see: the whole packet, when
     /// the stream could not take it in here, or only what the packet says to
     /// the sending side.
@@ -2055,12 +2072,12 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>
         || header.has_flag(FLAG_END)
         || header.has_flag(FLAG_HEARTBEAT);
     if !for_the_reader || header.has_flag(FLAG_DESTROY) {
-        return TakenIn { ack_owed: false, for_its_task: Some(data) };
+        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data) };
     }
 
     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
     if !guard.connected || guard.relay_target.is_some() {
-        return TakenIn { ack_owed: false, for_its_task: Some(data) };
+        return TakenIn { ack_owed: false, ack_now: false, for_its_task: Some(data) };
     }
 
     tracing::trace!(
@@ -2074,9 +2091,12 @@ pub(crate) fn take_in(inner: &Mutex<StreamInner>, header: &Header, data: Vec<u8>
         .has_news_for_sender(header)
         .then(|| sender_part(header, &data));
     let owed_already = guard.ack_wanted;
+    let carries_data = header.has_flag(FLAG_DATA) || header.has_flag(FLAG_END);
+    let had_already = carries_data && header.seq < guard.next_remote_seq;
     guard.receive_packet(header, data);
+    let ack_now = had_already || !guard.recv_buf.is_empty() || header.has_flag(FLAG_END);
 
-    TakenIn { ack_owed: guard.ack_wanted && !owed_already, for_its_task }
+    TakenIn { ack_owed: guard.ack_wanted && !owed_already, ack_now, for_its_task }
 }
 
 /// What a packet says to the sending side, as a packet of its own: its
@@ -2173,9 +2193,10 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
             match hook_and_socket {
                 Some((hook, sock)) => {
                     if hook(&sock, packet.addr.port(), packet.addr.ip()) {
+                        let link_mtu = super::pmtu::link_mtu(packet.addr);
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.set_remote_addr(packet.addr);
-                        guard.limit_mtu_to_link(super::sockopt::link_mtu(packet.addr));
+                        guard.limit_mtu_to_link(link_mtu);
                         guard.connected = true;
                         // What was written before the hook fired can go out
                         // now: a packet is addressed when it is sent.
@@ -2516,6 +2537,7 @@ mod mtu_tests {
         inner.outgoing.insert(seq, SentPacket {
             packet: packet.into(),
             time_sent: now,
+            first_sent: now,
             transmits: 1,
             rto_timeouts: 0,
             is_mtu_probe: true,
@@ -3111,6 +3133,67 @@ mod engine_tests {
         inner.process_ack(11, &[], now + millis(40));
         assert_eq!(inner.congestion.ca_state, CaState::Open);
         assert_eq!(inner.sacks, 0);
+    }
+
+    /// Two flights of ten packets, sent 20 ms apart, with the first five
+    /// packets acknowledged and ten more waiting. Returns the stream and the
+    /// time the second flight went out.
+    fn with_two_flights() -> (StreamInner, Instant) {
+        let mut inner = connected();
+        queue(&mut inner, 30);
+        let t0 = inner.epoch;
+        send(&mut inner, t0);
+
+        let now = t0 + millis(20);
+        inner.process_ack(5, &[], now);
+        let sent = send(&mut inner, now);
+        assert_eq!(data_seqs(&sent), (10..20).collect::<Vec<_>>());
+        assert_eq!(inner.congestion.delivered_in_time, 5);
+        (inner, now)
+    }
+
+    #[test]
+    fn a_packet_reported_late_is_delivered_but_not_in_time() {
+        let (mut inner, sent_at) = with_two_flights();
+
+        // Two packets of the second flight are acknowledged. The remote has
+        // the rest of the first flight as well, and does not say so yet.
+        let now = sent_at + millis(20);
+        inner.process_ack(5, &[SackRange { start: 10, end: 12 }], now);
+        assert_eq!(inner.congestion.delivered, 7);
+        assert_eq!(inner.congestion.delivered_in_time, 7);
+
+        // When it does, those packets had arrived before the two did.
+        inner.process_ack(5, &[SackRange { start: 7, end: 10 }], now + millis(1));
+        assert_eq!(inner.congestion.delivered, 10);
+        assert_eq!(inner.congestion.delivered_in_time, 7);
+    }
+
+    #[test]
+    fn an_acknowledgement_sooner_than_a_round_trip_answers_the_first_sending() {
+        let (mut inner, sent_at) = with_two_flights();
+        let now = sent_at + millis(20);
+        inner.process_ack(5, &[SackRange { start: 10, end: 12 }], now);
+
+        // 5 to 9 count as lost, and the window has room for two of them.
+        let sent = send(&mut inner, now);
+        assert_eq!(data_seqs(&sent), [5, 6]);
+        assert_eq!(inner.outgoing[&5].time_sent, now);
+        assert_eq!(inner.outgoing[&5].first_sent, inner.epoch);
+
+        // They are acknowledged 5 ms later, where a round trip takes 20. It
+        // is their first sending that arrived, before the second flight did.
+        inner.process_ack(7, &[], now + millis(5));
+        assert_eq!(inner.congestion.delivered, 9);
+        assert_eq!(inner.congestion.delivered_in_time, 7);
+
+        // The next two are acknowledged a round trip after they were sent
+        // again, which that sending may have taken.
+        let sent = send(&mut inner, now + millis(5));
+        assert_eq!(data_seqs(&sent), [7, 8]);
+        inner.process_ack(9, &[], now + millis(25));
+        assert_eq!(inner.congestion.delivered, 11);
+        assert_eq!(inner.congestion.delivered_in_time, 9);
     }
 
     #[test]
@@ -3717,6 +3800,24 @@ mod engine_tests {
         assert!(inner.take_ack().is_none());
         let t0 = inner.epoch;
         assert!(send(&mut inner, t0).is_empty(), "the stream's own task sends none either");
+    }
+
+    #[test]
+    fn an_acknowledgement_is_not_kept_waiting_for_a_gap_a_repeat_or_the_end() {
+        let (inner, _reader) = with_reader();
+        let inner = Mutex::new(inner);
+        let take = |type_flags, seq| {
+            let (header, data) = incoming(type_flags, seq, 0, b"data");
+            take_in(&inner, &header, data).ack_now
+        };
+
+        assert!(!take(FLAG_DATA, 0), "in order: more is on its way");
+        assert!(take(FLAG_DATA, 2), "a packet is missing before it");
+        assert!(take(FLAG_DATA, 3), "and still is");
+        assert!(!take(FLAG_DATA, 1), "the gap is filled");
+        assert!(take(FLAG_DATA, 1), "the remote sent it twice");
+        assert!(!take(FLAG_HEARTBEAT, 0), "a heartbeat is no data");
+        assert!(take(FLAG_DATA | FLAG_END, 4), "nothing follows the end");
     }
 
     #[test]
