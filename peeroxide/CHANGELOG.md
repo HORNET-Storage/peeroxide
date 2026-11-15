@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A swarm sets the read buffer limit of its DHT's config (`SwarmConfig::dht.read_buffer_limit`, see `peeroxide-dht`) on the connections it accepts, direct, holepunched or through a relay, as its DHT sets it on those the swarm makes, so the one setting covers all of a swarm's connections ([#38](https://github.com/Rightbracket/peeroxide/issues/38)). By default there is none, as before.
+
 ### Changed
 
 - A write to a connection's stream returns once the message is queued for sending, where it returned once the remote had acknowledged it, two round trips later (see `peeroxide-dht` and `libudx`). `shutdown` on the stream returns once everything written has been acknowledged.
+- A swarm whose DHT isn't firewalled puts its own address first in the records it announces on its topics, so peers that find it there send their handshake straight to it, and as a client it is dialled by a firewalled server instead of holepunching to it, as a Node.js swarm is (see `peeroxide-dht`).
+
+### Fixed
+
+- A swarm whose DHT isn't firewalled gives the peers that connect to it the address the network sees it at, first, as a Node.js swarm does, and a firewalled one no longer gives them the address its NAT analysis found, which a Node.js swarm doesn't either (see `peeroxide-dht`).
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
 

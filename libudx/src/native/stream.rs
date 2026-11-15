@@ -432,6 +432,11 @@ pub(crate) struct StreamInner {
     /// Retained socket clone supplied to `set_firewall_hook`; forwarded to the
     /// hook and cleared after the hook fires.
     firewall_socket: Option<super::socket::UdxSocket>,
+    /// Whether the stream waits on its firewall hook: from `set_firewall_hook`
+    /// until the hook lets a remote in, or the stream is over. It holds while
+    /// the hook runs, which `firewall_hook` does not: the hook is taken out of
+    /// the stream to be called.
+    firewall_pending: bool,
 }
 
 impl StreamInner {
@@ -509,20 +514,23 @@ impl StreamInner {
             relay_target: None,
             firewall_hook: None,
             firewall_socket: None,
+            firewall_pending: false,
         }
     }
 
     // ── Stream termination ──────────────────────────────────────────────────
 
     /// Fail every write that has not been acknowledged with `StreamClosed`,
-    /// mark the stream disconnected, and drop `notify_tx` so future sends
-    /// fail fast. Idempotent — safe to call more than once.
+    /// mark the stream disconnected and no longer waiting on a firewall hook,
+    /// and drop `notify_tx` so future sends fail fast. Idempotent — safe to
+    /// call more than once.
     fn terminate(&mut self) {
         if !self.terminated && !self.drained() {
             self.lost_writes = true;
         }
         self.connected = false;
         self.terminated = true;
+        self.firewall_pending = false;
         self.notify_tx = None;
         self.fail_writes(|| UdxError::StreamClosed);
         // Nothing more arrives: a reader that is waiting finds the end.
@@ -571,9 +579,15 @@ impl StreamInner {
         self.congestion.on_mtu_change(self.max_payload());
     }
 
-    /// Keep the search for the path's MTU within the MTU of the link the
-    /// remote is reached over, where the system tells it: a larger packet
-    /// would not leave this machine. C: the end of `udx_stream_connect`.
+    /// Keep the stream's packets within the MTU of the link the remote is
+    /// reached over, where the system tells it: a larger packet would not
+    /// leave this machine. The search for the path's MTU ends there, as at
+    /// the end of C's `udx_stream_connect`.
+    ///
+    /// On a link narrower than the starting size, the stream's packets are
+    /// made the link's size too. C keeps them at the starting size, and as
+    /// its packets are marked "don't fragment", the system then refuses
+    /// every full one, and the stream fails.
     fn limit_mtu_to_link(&mut self, link_mtu: Option<usize>) {
         let Some(link_mtu) = link_mtu.filter(|&mtu| mtu <= MTU_MAX) else {
             self.mtu_max = MTU_MAX;
@@ -582,6 +596,11 @@ impl StreamInner {
         if link_mtu <= MTU_BASE {
             // Nothing above the starting size to search.
             self.mtu_state = MtuState::SearchComplete;
+        }
+        if link_mtu < self.mtu {
+            // With room for a byte of payload, whatever the link says.
+            self.mtu = link_mtu.max(self.ip_overhead() + HEADER_SIZE + 1);
+            self.congestion.on_mtu_change(self.max_payload());
         }
         self.mtu_max = link_mtu;
     }
@@ -660,7 +679,7 @@ impl StreamInner {
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        if !self.connected && self.firewall_hook.is_none() {
+        if !self.connected && !self.awaiting_firewall() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
@@ -710,8 +729,8 @@ impl StreamInner {
 
     /// As [`queue_end`](Self::queue_end), and also on a stream still waiting
     /// on its firewall hook: the end then goes out after what was written,
-    /// once the hook lets a remote in. For the async adapter's shutdown,
-    /// whose writes are already queued that way.
+    /// once the hook lets a remote in. For the async adapter's shutdown, whose
+    /// writes are already queued that way, and `UdxStream::shutdown_when_connected`.
     pub(crate) fn queue_end_awaiting_firewall(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
         self.queue_end_inner(true)
     }
@@ -723,7 +742,7 @@ impl StreamInner {
         if self.terminated {
             return Err(UdxError::StreamClosed);
         }
-        let awaiting_firewall = awaiting_firewall_ok && self.firewall_hook.is_some();
+        let awaiting_firewall = awaiting_firewall_ok && self.awaiting_firewall();
         if !self.connected && !awaiting_firewall {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
@@ -889,9 +908,11 @@ impl StreamInner {
     }
 
     /// Whether the stream is still waiting on its firewall hook, which lets
-    /// a remote in or turns it away on the first packet that arrives.
+    /// a remote in or turns it away on the first packet that arrives. It
+    /// is, too, while the hook runs: a stream is connected only once the
+    /// hook has let the remote in.
     pub(crate) fn awaiting_firewall(&self) -> bool {
-        self.firewall_hook.is_some()
+        self.firewall_pending
     }
 
     /// Whether everything written has been acknowledged.
@@ -929,15 +950,20 @@ impl StreamInner {
 
     /// What the stream holds for its reader, in bytes: what the reader has
     /// been handed and has not taken, and what arrived out of order.
+    fn held(&self) -> usize {
+        self.handed_untaken() + self.recv_buf_held
+    }
+
+    /// What the reader has been handed and has not taken, in bytes, as
+    /// packets count.
     ///
     /// A stream whose reader is gone holds nothing for it: what the reader
     /// had not taken went with it, and what arrives in order is dropped.
-    fn held(&self) -> usize {
+    fn handed_untaken(&self) -> usize {
         if self.read_tx.is_closed() {
-            return self.recv_buf_held;
+            return 0;
         }
-        let unread = self.handed.wrapping_sub(self.unread.taken.load(Ordering::Relaxed));
-        unread + self.recv_buf_held
+        self.handed.wrapping_sub(self.unread.taken.load(Ordering::Relaxed))
     }
 
     /// The receive window to advertise. C: `get_recv_rwnd`.
@@ -951,8 +977,9 @@ impl StreamInner {
     /// waiting for. Room for less than a full packet is advertised as none:
     /// a sender counts its window in whole packets, and C libudx asks about
     /// a window again only when it is zero. While a packet is missing that
-    /// the stream would take, the window is never less than that one
-    /// packet, so that a sender with no window left can send it again.
+    /// the stream would take ([`takes_the_awaited`](Self::takes_the_awaited)),
+    /// the window is never less than that one packet, so that a sender with
+    /// no window left can send it again.
     fn recv_window(&self) -> u32 {
         let Some(limit) = self.read_limit else {
             return DEFAULT_RWND;
@@ -962,7 +989,7 @@ impl StreamInner {
         let room = limit.saturating_sub(held + FULL_PACKET);
         if room >= FULL_PACKET {
             room as u32
-        } else if !self.recv_buf.is_empty() && held < limit {
+        } else if !self.recv_buf.is_empty() && self.takes_the_awaited(limit) {
             FULL_PACKET as u32
         } else {
             0
@@ -980,15 +1007,19 @@ impl StreamInner {
     /// `len` bytes. A stream without a limit takes every packet.
     ///
     /// The packet the reader is waiting for is taken while the stream holds
-    /// less than its limit. That lets what waits behind it through to the
-    /// reader, and can take the stream over its limit by that one packet.
-    /// Any other packet is taken if it leaves room for a full one, which is
-    /// kept for the one awaited: packets that arrived ahead of a gap could
-    /// otherwise fill the stream and keep out the one that closes the gap.
+    /// less than its limit, or once the reader has taken all it was handed
+    /// ([`takes_the_awaited`](Self::takes_the_awaited)). That lets what
+    /// waits behind it through to the reader, and can take the stream over
+    /// its limit by that one packet. Any other packet is taken if it leaves
+    /// room for a full one, which is kept for the one awaited: packets that
+    /// arrived ahead of a gap could otherwise fill the stream and keep out
+    /// the one that closes the gap.
     ///
-    /// So a stream never holds more than its limit and one full packet. A
-    /// packet that carries more than a full one, which no stream sends, is
-    /// taken only if it fits under the limit.
+    /// So a stream never holds more than its limit and one full packet,
+    /// unless the limit was set or lowered while it held more: it then takes
+    /// nothing more until its reader has taken enough, but the packet the
+    /// reader waits for. A packet that carries more than a full one, which
+    /// no stream sends, is taken only if it fits under the limit.
     ///
     /// A packet that has been taken is never dropped again. The remote has
     /// been told of it, and no longer holds it to send it again.
@@ -1000,24 +1031,43 @@ impl StreamInner {
         if seq == self.next_remote_seq {
             // A packet that carries nothing is not held.
             let fits = len <= FULL_PACKET || self.held() + len <= limit;
-            len == 0 || (self.held() < limit && fits)
+            len == 0 || (self.takes_the_awaited(limit) && fits)
         } else {
             self.held() + held_cost(len) + FULL_PACKET <= limit
         }
+    }
+
+    /// Whether the stream takes the packet its reader waits for, under
+    /// `limit`: while it holds less than the limit, or once its reader has
+    /// taken all it was handed.
+    ///
+    /// Only that packet lets what waits behind it through to the reader.
+    /// While a limit holds, what waits there leaves room for it. A limit set
+    /// or lowered while more than it waits there would otherwise keep it out
+    /// for good, since the reader can take nothing of what waits until it
+    /// comes. Taking it whenever the reader holds less than the limit would
+    /// end that too, but would let a remote that takes no notice of the
+    /// window fill a stream with twice its limit: the limit ahead of a gap,
+    /// and the limit again in order up to it.
+    fn takes_the_awaited(&self, limit: usize) -> bool {
+        self.held() < limit || self.handed_untaken() == 0
     }
 
     /// The reader has taken data from a stream that has a limit. The remote
     /// may be waiting for room, so it is told once there is a quarter of
     /// the limit more of it than the stream last advertised, or a full
     /// packet's if that is more. Told of less, it would send in dribbles.
-    /// It does not depend on being told: a sender asks about a window that
-    /// has no room.
+    /// Room for a missing packet, after none, is told at once: only that
+    /// packet lets what waits behind it through to the reader. It does not
+    /// depend on being told: a sender asks about a window that has no room.
     pub(crate) fn reader_took(&mut self) {
         let Some(limit) = self.read_limit else {
             return;
         };
+        let window = self.recv_window();
         let step = (limit / 4).max(FULL_PACKET as u32);
-        if self.recv_window() >= self.advertised_rwnd.saturating_add(step) {
+        let opens_for_the_missing = self.advertised_rwnd == 0 && window > 0 && !self.recv_buf.is_empty();
+        if window >= self.advertised_rwnd.saturating_add(step) || opens_for_the_missing {
             self.ack_wanted = true;
             self.notify_processor();
         }
@@ -1811,7 +1861,8 @@ impl StreamInner {
     // ── SACK generation ──────────────────────────────────────────────────────
 
     /// How many SACK ranges an acknowledgement may carry: as many as fit a
-    /// packet of the starting MTU, which every path carries.
+    /// packet of the starting MTU, which every path carries, or of the
+    /// stream's own MTU on a link narrower than that.
     ///
     /// The remote learns of a gap only from the ranges around it, and the
     /// ranges are the lowest ones. So what it can repair in one round trip is
@@ -1819,7 +1870,7 @@ impl StreamInner {
     /// the faster the more ranges fit. C libudx sends 51 at most and reads as
     /// many as a packet holds.
     fn max_sack_ranges(&self) -> usize {
-        (MTU_BASE - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
+        (self.mtu.min(MTU_BASE) - self.ip_overhead() - HEADER_SIZE) / SACK_RANGE_SIZE
     }
 
     /// Compute SACK ranges from the out-of-order receive buffer.
@@ -2194,8 +2245,9 @@ impl UdxStream {
 
     /// The size of the largest IP packet the stream sends at present, in
     /// bytes: the IP and UDP headers, the UDX header and the payload. It
-    /// starts at 1200 and grows as larger packets are found to arrive. C
-    /// libudx and udx-native call it the stream's MTU.
+    /// starts at 1200, or on Linux at the MTU of the link the remote is
+    /// reached over if that is smaller, and grows as larger packets are
+    /// found to arrive. C libudx and udx-native call it the stream's MTU.
     pub fn effective_mtu(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.mtu
@@ -2217,6 +2269,11 @@ impl UdxStream {
     /// and the remote sends it again: the stream never holds more than the
     /// limit and one full packet, whatever the remote does. A packet counts
     /// for its payload, and for 128 bytes if it carries less.
+    ///
+    /// A limit can be set, changed or lifted at any time. A stream that holds
+    /// more than a new limit keeps what it holds, since the remote no longer
+    /// has it to send again, and takes more in as its reader takes what it
+    /// holds.
     ///
     /// A reader that keeps up is not slowed down, with one exception: the
     /// limit is also the most a remote has on its way at one time. Over a
@@ -2336,6 +2393,29 @@ impl UdxStream {
         acked.await.map_err(|_| UdxError::StreamClosed)?
     }
 
+    /// Send a write-end (FIN) after everything written and wait for the
+    /// remote peer to ACK it, as [`shutdown`](Self::shutdown) does, on a
+    /// stream that may still wait on its firewall hook
+    /// ([`set_firewall_hook`](Self::set_firewall_hook)).
+    ///
+    /// On such a stream the FIN goes out once the hook lets a remote in,
+    /// after what was written before it, and this returns once that remote
+    /// has acknowledged it. It fails if the hook turns the remote away. On a
+    /// connected stream it is `shutdown`, and on a stream that is neither
+    /// connected nor waiting on a hook it fails at once, as `shutdown` does.
+    ///
+    /// `shutdown` itself fails at once on a stream that waits on its hook,
+    /// as C libudx's `udx_stream_write_end` does on a stream that is not
+    /// connected.
+    pub async fn shutdown_when_connected(&self) -> Result<()> {
+        let acked = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.queue_end_awaiting_firewall()?
+        };
+
+        acked.await.map_err(|_| UdxError::StreamClosed)?
+    }
+
     /// Set up packet-level relay forwarding to `destination`.
     ///
     /// Both streams must be on the same runtime. Relayed packets bypass
@@ -2393,6 +2473,7 @@ impl UdxStream {
             inner.notify_tx = Some(notify_tx);
             inner.firewall_hook = Some(Box::new(hook));
             inner.firewall_socket = Some(socket.clone());
+            inner.firewall_pending = true;
         }
 
         let tx = self
@@ -2696,7 +2777,10 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.set_remote_addr(packet.addr);
                         guard.limit_mtu_to_link(link_mtu);
+                        // Under one lock: a stream is waiting on its hook or
+                        // connected, and never neither.
                         guard.connected = true;
+                        guard.firewall_pending = false;
                         // What was written before the hook fired can go out
                         // now: a packet is addressed when it is sent.
                         if let Some(ref tx) = guard.notify_tx {
@@ -2705,6 +2789,9 @@ async fn handle_incoming(inner: &Arc<Mutex<StreamInner>>, packet: IncomingPacket
                         tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
                     } else {
                         tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
+                        // The stream waits on its hook until it is terminated,
+                        // as the processor exits: a shutdown in between queues
+                        // its end, which then fails.
                         return false;
                     }
                 }
@@ -2940,7 +3027,7 @@ async fn process_incoming(
             }
             // What the stream could still deliver, by the acknowledgement
             // it has reached.
-            let undelivered = ((guard.connected || guard.firewall_hook.is_some()) && !guard.drained())
+            let undelivered = ((guard.connected || guard.awaiting_firewall()) && !guard.drained())
                 .then_some(guard.remote_acked);
             (gave_up, guard.udp.clone(), guard.next_deadline(), undelivered)
         };
@@ -3224,6 +3311,37 @@ mod mtu_tests {
 
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert_eq!(inner.mtu, MTU_BASE);
+    }
+
+    #[test]
+    fn a_link_narrower_than_the_starting_size_gets_packets_no_larger_than_itself() {
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(1_000));
+
+        assert_eq!(inner.mtu_state, MtuState::SearchComplete);
+        assert_eq!(inner.mtu, 1_000);
+        assert_eq!(inner.max_payload(), 1_000 - IPV4_UDP_OVERHEAD - HEADER_SIZE);
+        assert_eq!(inner.congestion.mss as usize, inner.max_payload());
+
+        // An acknowledgement that names as many ranges as it can fits too.
+        for seq in (1..600).step_by(2) {
+            let packet = build_data_packet(0, seq, 0, &[1u8; 10]);
+            inner.receive_packet(&Header::decode(&packet).unwrap(), packet);
+        }
+        let ack = inner.build_ack().len() + IPV4_UDP_OVERHEAD;
+        assert!(ack <= 1_000, "an acknowledgement of {ack} bytes");
+        assert!(ack > 1_000 - SACK_RANGE_SIZE, "one of {ack} bytes names fewer ranges than fit");
+    }
+
+    #[test]
+    fn a_link_too_narrow_for_the_headers_still_leaves_room_for_a_byte() {
+        // No system reports an IPv4 link under 68 bytes, but the size is the
+        // system's to give.
+        let mut inner = stream_to(V4);
+        inner.limit_mtu_to_link(Some(40));
+
+        assert_eq!(inner.max_payload(), 1);
+        assert_eq!(inner.congestion.mss, 1);
     }
 
     #[test]
@@ -5428,6 +5546,76 @@ mod engine_tests {
     }
 
     #[test]
+    fn a_remote_that_sends_ahead_of_a_gap_and_then_up_to_it_cannot_fill_a_stream_past_its_limit() {
+        const LIMIT: usize = 65_536;
+        let (mut inner, _reader) = limited(LIMIT);
+
+        // Far ahead of a gap first, and then in order up to it, to a reader
+        // that takes nothing. Neither alone takes the stream past its limit,
+        // and together they do not either.
+        for seq in 1_000..5_000 {
+            arrives(&mut inner, seq, MAX_PAYLOAD);
+        }
+        for seq in 0..1_000 {
+            arrives(&mut inner, seq, MAX_PAYLOAD);
+        }
+        assert!(inner.held() <= LIMIT + MAX_PAYLOAD, "it holds {} bytes", inner.held());
+    }
+
+    // A limit set or lowered while more than it waits behind a gap. What
+    // waits there is kept, since the remote no longer holds it, and only the
+    // missing packet lets it through to the reader.
+
+    #[test]
+    fn a_limit_set_while_more_than_it_waits_behind_a_gap_still_lets_the_missing_packet_in() {
+        let (mut inner, mut reader) = with_reader();
+        for seq in 1..=100 {
+            assert!(arrives(&mut inner, seq, 1_000));
+        }
+        assert_eq!(inner.held(), 100_000);
+
+        // The reader holds nothing, so the stream has room for the packet
+        // that lets the rest through, says so, and takes it.
+        inner.set_read_limit(Some(16_384));
+        assert_eq!(window(&mut inner), FULL_PACKET);
+        assert!(arrives(&mut inner, 0, 1_000), "the missing packet was turned away");
+        assert!(inner.recv_buf.is_empty());
+        assert_eq!(inner.next_remote_seq, 101);
+        assert_eq!(read(&mut reader).0.len(), 101_000);
+    }
+
+    #[test]
+    fn a_limit_lowered_below_what_waits_behind_a_gap_lets_the_missing_packet_in_once_the_reader_has_caught_up() {
+        let (mut inner, mut reader) = limited(1 << 20);
+        // Twenty packets in order, which the reader has yet to take, and a
+        // hundred after a missing one.
+        for seq in 0..20 {
+            assert!(arrives(&mut inner, seq, 1_000));
+        }
+        for seq in 21..=120 {
+            assert!(arrives(&mut inner, seq, 1_000));
+        }
+        inner.set_read_limit(Some(16_384));
+
+        // While the reader holds what it was handed, the stream is full.
+        assert_eq!(window(&mut inner), 0);
+        assert!(!arrives(&mut inner, 20, 1_000));
+        let _ = inner.take_ack();
+
+        // Once the reader has taken all of it, the stream tells the remote
+        // of room for the missing packet without being asked, and takes it.
+        assert_eq!(reader_takes(&mut inner, &mut reader, 19), 19_000);
+        assert!(!inner.ack_wanted, "nothing has changed for the remote yet");
+        assert_eq!(reader_takes(&mut inner, &mut reader, 1), 1_000);
+        assert!(inner.ack_wanted, "the remote was not told of room for the missing packet");
+        assert_eq!(window(&mut inner), FULL_PACKET);
+        assert!(arrives(&mut inner, 20, 1_000), "the missing packet was turned away");
+        assert!(inner.recv_buf.is_empty());
+        assert_eq!(inner.next_remote_seq, 121);
+        assert_eq!(read(&mut reader).0.len(), 101_000);
+    }
+
+    #[test]
     fn the_end_of_a_stream_is_handed_over_once_and_nothing_after_it_is_taken() {
         /// A packet of the kind given arrives, numbered `seq`, with three
         /// bytes in it if it carries data.
@@ -5787,9 +5975,23 @@ mod engine_tests {
         heeds_the_window: bool,
         reads: impl Fn(u64) -> usize,
     ) -> Flow {
+        transfer_to_a_reader_with(first, packets, |_, _| limit, path, heeds_the_window, reads)
+    }
+
+    /// As [`transfer_to_a_reader`], with the receiving stream's limit decided
+    /// at the start of every millisecond, by `limit(ms, receiver)`.
+    fn transfer_to_a_reader_with(
+        first: u32,
+        packets: usize,
+        limit: impl Fn(u64, &StreamInner) -> Option<usize>,
+        path: fn(u64, u64) -> Option<u64>,
+        heeds_the_window: bool,
+        reads: impl Fn(u64) -> usize,
+    ) -> Flow {
         let (mut sender, _) = starting_at(first);
         let (mut receiver, mut reader) = starting_at(first);
-        receiver.set_read_limit(limit.map(|limit| limit as u32));
+        let mut limit_now = limit(0, &receiver);
+        receiver.set_read_limit(limit_now.map(|limit| limit as u32));
         let (tx, mut written) = oneshot::channel();
         let data: Vec<u8> = (0..packets * MAX_PAYLOAD).map(|i| (i % 251) as u8).collect();
         sender.push_write(QueuedWrite { data: data.clone(), taken: 0, end: false, tx: Some(tx) });
@@ -5814,6 +6016,11 @@ mod engine_tests {
         for ms in 0..300_000 {
             let now = t0 + millis(ms);
             flow.took = ms;
+            let wanted = limit(ms, &receiver);
+            if wanted != limit_now {
+                limit_now = wanted;
+                receiver.set_read_limit(limit_now.map(|limit| limit as u32));
+            }
 
             let (mut due, later): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut on_path).into_iter().partition(|packet| packet.0 <= ms);
@@ -6057,6 +6264,30 @@ mod engine_tests {
         assert!(held > LIMIT / 2, "the stream held {held} bytes");
         assert!(waiting > data.len() - 2 * LIMIT, "{waiting} bytes waited with the writer");
         assert!(read == data, "{} of {} bytes arrived, or not as sent", read.len(), data.len());
+    }
+
+    #[test]
+    fn a_limit_lowered_while_more_than_it_waits_behind_a_gap_does_not_stall_a_transfer() {
+        const LIMIT: usize = 16_384;
+        // What is sent in the hundredth millisecond is lost. The rest takes
+        // ten milliseconds.
+        fn loses_a_millisecond(_nth: u64, ms: u64) -> Option<u64> {
+            (ms != 100).then_some(10)
+        }
+        // No limit until more than one waits behind a gap, and one from then.
+        let lowered = std::cell::Cell::new(None);
+        let limit = |ms: u64, receiver: &StreamInner| {
+            if lowered.get().is_none() && receiver.recv_buf_held > LIMIT {
+                lowered.set(Some(ms));
+            }
+            lowered.get().map(|_| LIMIT)
+        };
+
+        let flow = transfer_to_a_reader_with(0, 2_000, limit, loses_a_millisecond, true, |_| usize::MAX);
+        let lowered = lowered.get().expect("more than the limit never waited behind a gap");
+        assert!(flow.intact, "the transfer stalled once the limit came in, at {lowered} ms");
+        assert_eq!(flow.gave_up, None);
+        assert!(flow.took < 30_000, "it took {} ms", flow.took);
     }
 
     #[tokio::test]
